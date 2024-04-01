@@ -11,6 +11,10 @@ repository.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
+alloy-signer-aws.workspace = true
+alloy-signer.workspace = true
+alloy-consensus.workspace = true
+alloy-network.workspace = true
 
 ethers-core.workspace = true
 ethers-providers.workspace = true
@@ -18,6 +22,8 @@ ethers-signers = { workspace = true, features = ["aws", "ledger", "trezor"] }
 
 rusoto_core = { version = "0.48", default-features = false }
 rusoto_kms = { version = "0.48", default-features = false }
+aws-sdk-kms = "1.15.0"
+aws-config = "1.1.4"
 
 foundry-config.workspace = true
 foundry-common.workspace = true

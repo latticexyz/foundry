@@ -1,22 +1,26 @@
 use crate::error::WalletSignerError;
+use alloy_consensus::TxEip1559;
+use alloy_network::TxKind;
 use alloy_primitives::B256;
+use alloy_signer::Signer as AlloySigner;
+use alloy_signer_aws::AwsSigner;
 use async_trait::async_trait;
 use ethers_core::types::{
     transaction::{eip2718::TypedTransaction, eip712::Eip712},
     Signature,
 };
 use ethers_signers::{
-    coins_bip39::English, AwsSigner, HDPath as LedgerHDPath, Ledger, LocalWallet, MnemonicBuilder,
-    Signer, Trezor, TrezorHDPath,
+    coins_bip39::English, HDPath as LedgerHDPath, Ledger, LocalWallet, MnemonicBuilder, Signer,
+    Trezor, TrezorHDPath,
 };
-use rusoto_core::{
-    credential::ChainProvider as AwsChainProvider, region::Region as AwsRegion,
-    request::HttpClient as AwsHttpClient, Client as AwsClient,
-};
-use rusoto_kms::KmsClient;
+use foundry_common::types::{ToAlloy, ToEthers};
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, WalletSignerError>;
+
+fn sig_to_ethers(sig: alloy_signer::Signature) -> Signature {
+    Signature { r: sig.r().to_ethers(), s: sig.s().to_ethers(), v: sig.v().to_u64() }
+}
 
 /// Wrapper enum around different signers.
 #[derive(Debug)]
@@ -44,12 +48,12 @@ impl WalletSigner {
     }
 
     pub async fn from_aws(key_id: &str) -> Result<Self> {
-        let client =
-            AwsClient::new_with(AwsChainProvider::default(), AwsHttpClient::new().unwrap());
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let client = aws_sdk_kms::Client::new(&config);
 
-        let kms = KmsClient::new_with_client(client, AwsRegion::default());
+        let signer = AwsSigner::new(client, key_id.to_string(), None).await?;
 
-        Ok(Self::Aws(AwsSigner::new(kms, key_id, 1).await?))
+        Ok(Self::Aws(signer))
     }
 
     pub fn from_private_key(private_key: impl AsRef<[u8]>) -> Result<Self> {
@@ -95,7 +99,7 @@ impl WalletSigner {
                 }
             }
             WalletSigner::Aws(aws) => {
-                senders.push(aws.address());
+                senders.push(aws.address().to_ethers());
             }
         }
         Ok(senders)
@@ -129,7 +133,8 @@ macro_rules! delegate {
             Self::Local($inner) => $e,
             Self::Ledger($inner) => $e,
             Self::Trezor($inner) => $e,
-            Self::Aws($inner) => $e,
+            _ => unimplemented!("handle separately"),
+            // Self::Aws($inner) => $e,
         }
     };
 }
@@ -139,11 +144,36 @@ impl Signer for WalletSigner {
     type Error = WalletSignerError;
 
     async fn sign_message<S: Send + Sync + AsRef<[u8]>>(&self, message: S) -> Result<Signature> {
+        if let Self::Aws(inner) = self {
+            let sig = inner.sign_message(message.as_ref()).await?;
+            return Ok(sig_to_ethers(sig));
+        }
         delegate!(self, inner => inner.sign_message(message).await.map_err(Into::into))
     }
 
-    async fn sign_transaction(&self, message: &TypedTransaction) -> Result<Signature> {
-        delegate!(self, inner => inner.sign_transaction(message).await.map_err(Into::into))
+    async fn sign_transaction(&self, tx: &TypedTransaction) -> Result<Signature> {
+        if let Self::Aws(inner) = self {
+            let mut msg = match tx {
+                TypedTransaction::Eip1559(tx) => TxEip1559 {
+                    chain_id: tx.chain_id.unwrap_or_default().as_u64(),
+                    nonce: tx.nonce.unwrap_or_default().as_u64(),
+                    gas_limit: tx.gas.unwrap_or_default().as_u64(),
+                    value: tx.value.unwrap_or_default().to_alloy(),
+                    max_fee_per_gas: tx.max_fee_per_gas.unwrap_or_default().as_u64() as u128,
+                    max_priority_fee_per_gas: tx
+                        .max_priority_fee_per_gas
+                        .unwrap_or_default()
+                        .as_u64() as u128,
+                    to: TxKind::Call(tx.to.clone().unwrap().as_address().unwrap().to_alloy()),
+                    input: tx.data.clone().unwrap_or_default().to_alloy(),
+                    access_list: Default::default(),
+                },
+                _ => unimplemented!("only EIP-1559 transactions are supported at this time"),
+            };
+            let sig = inner.sign_transaction(&mut msg).await?;
+            return Ok(sig_to_ethers(sig));
+        }
+        delegate!(self, inner => inner.sign_transaction(tx).await.map_err(Into::into))
     }
 
     async fn sign_typed_data<T: Eip712 + Send + Sync>(&self, payload: &T) -> Result<Signature> {
@@ -151,10 +181,16 @@ impl Signer for WalletSigner {
     }
 
     fn address(&self) -> ethers_core::types::Address {
+        if let Self::Aws(inner) = self {
+            return inner.address().to_ethers();
+        }
         delegate!(self, inner => inner.address())
     }
 
     fn chain_id(&self) -> u64 {
+        if let Self::Aws(inner) = self {
+            return inner.chain_id().expect("aws signer did not set chain id");
+        }
         delegate!(self, inner => inner.chain_id())
     }
 
@@ -163,7 +199,7 @@ impl Signer for WalletSigner {
             Self::Local(inner) => Self::Local(inner.with_chain_id(chain_id)),
             Self::Ledger(inner) => Self::Ledger(inner.with_chain_id(chain_id)),
             Self::Trezor(inner) => Self::Trezor(inner.with_chain_id(chain_id)),
-            Self::Aws(inner) => Self::Aws(inner.with_chain_id(chain_id)),
+            Self::Aws(inner) => Self::Aws(inner.with_chain_id(Some(chain_id.into()))),
         }
     }
 }
@@ -201,9 +237,10 @@ impl Signer for &WalletSigner {
 impl WalletSigner {
     pub async fn sign_hash(&self, hash: &B256) -> Result<Signature> {
         match self {
-            // TODO: AWS can sign hashes but utilities aren't exposed in ethers-signers.
-            // TODO: Implement with alloy-signer.
-            Self::Aws(_aws) => Err(WalletSignerError::CannotSignRawHash("AWS")),
+            Self::Aws(aws) => {
+               let sig = aws.sign_hash(*hash).await?;
+               Ok(sig_to_ethers(sig))
+            },
             Self::Ledger(_) => Err(WalletSignerError::CannotSignRawHash("Ledger")),
             Self::Local(wallet) => wallet.sign_hash(hash.0.into()).map_err(Into::into),
             Self::Trezor(_) => Err(WalletSignerError::CannotSignRawHash("Trezor")),

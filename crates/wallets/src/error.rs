@@ -1,4 +1,5 @@
-use ethers_signers::{AwsSignerError, LedgerError, TrezorError, WalletError};
+use alloy_signer_aws::AwsSignerError;
+use ethers_signers::{LedgerError, TrezorError, WalletError};
 use hex::FromHexError;
 
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +20,8 @@ pub enum WalletSignerError {
     Trezor(#[from] TrezorError),
     #[error(transparent)]
     Aws(#[from] AwsSignerError),
+    #[error(transparent)]
+    Alloy(#[from] alloy_signer::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
